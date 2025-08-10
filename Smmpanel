@@ -1,0 +1,391 @@
+#!/bin/bash
+# build_smmslice_full.sh
+# Full Laravel SMM Panel auto-builder (sandbox-ready)
+# Requirements: php (8.1+), composer, mysql client, node/npm, zip
+# Usage: chmod +x build_smmslice_full.sh && ./build_smmslice_full.sh
+
+set -euo pipefail
+
+PROJECT_NAME="smm-panel-smmslice"
+DB_NAME="smm_slice_db"
+DB_USER="root"
+DB_PASS=""
+DB_HOST="127.0.0.1"
+DB_PORT="3306"
+
+LICENSE_KEY="SMMSLICE-2025-HYBRID-KEY-987654321"
+ADMIN_EMAIL="smmshope@gmail.com"
+ADMIN_PASS="Password@123"   # change after install
+CUSTOMER_EMAIL="buyer@example.com"
+CUSTOMER_PASS="BuyerPass123"
+
+BASE_CURRENCY="INR"
+
+# Payment placeholders (sandbox/test)
+STRIPE_KEY="pk_test_xxx"
+STRIPE_SECRET="sk_test_xxx"
+PAYPAL_CLIENT_ID="paypal_test_client_id"
+PAYPAL_SECRET="paypal_test_secret"
+RAZORPAY_KEY="rzp_test_xxx"
+RAZORPAY_SECRET="rzp_test_secret"
+COINPAYMENTS_MERCHANT_ID="cp_test_mid"
+COINPAYMENTS_SECRET="cp_test_secret"
+
+echo "=== START: Building $PROJECT_NAME ==="
+
+# create Laravel project
+if [ -d "$PROJECT_NAME" ]; then
+  echo "Project folder already exists. Removing it."
+  rm -rf "$PROJECT_NAME"
+fi
+
+composer create-project --prefer-dist laravel/laravel "$PROJECT_NAME" || { echo "composer create-project failed"; exit 1; }
+cd "$PROJECT_NAME"
+
+echo "=== Creating .env ==="
+cp .env.example .env
+
+# write DB and keys to .env
+php -r "
+\$env = file_get_contents('.env');
+\$env = preg_replace('/DB_DATABASE=.*/', 'DB_DATABASE=$DB_NAME', \$env);
+\$env = preg_replace('/DB_USERNAME=.*/', 'DB_USERNAME=$DB_USER', \$env);
+\$env = preg_replace('/DB_PASSWORD=.*/', 'DB_PASSWORD=$DB_PASS', \$env);
+file_put_contents('.env', \$env);
+"
+
+# append custom env values
+cat >> .env <<EOL
+
+LICENSE_KEY=$LICENSE_KEY
+ADMIN_EMAIL=$ADMIN_EMAIL
+ADMIN_PASSWORD=$ADMIN_PASS
+BASE_CURRENCY=$BASE_CURRENCY
+
+STRIPE_KEY=$STRIPE_KEY
+STRIPE_SECRET=$STRIPE_SECRET
+
+PAYPAL_CLIENT_ID=$PAYPAL_CLIENT_ID
+PAYPAL_SECRET=$PAYPAL_SECRET
+
+RAZORPAY_KEY=$RAZORPAY_KEY
+RAZORPAY_SECRET=$RAZORPAY_SECRET
+
+COINPAYMENTS_MERCHANT_ID=$COINPAYMENTS_MERCHANT_ID
+COINPAYMENTS_SECRET=$COINPAYMENTS_SECRET
+
+APP_URL=http://localhost
+EOL
+
+echo "=== Attempting to create DB (if mysql user allows) ==="
+if mysql -u"$DB_USER" -p"$DB_PASS" -h "$DB_HOST" -P "$DB_PORT" -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+  echo "Database ready: $DB_NAME"
+else
+  echo "Could not create DB automatically. Make sure $DB_NAME exists or edit the script."
+fi
+
+# create app directories and basic files
+mkdir -p app/Http/Controllers/Admin app/Http/Controllers/Api app/Http/Controllers/Auth app/Services app/Models resources/views/admin resources/views/customer resources/views/auth database/migrations database/seeders routes/api
+
+echo "=== Adding License Middleware ==="
+cat > app/Http/Middleware/CheckLicense.php <<'PHP'
+<?php
+namespace App\Http\Middleware;
+use Closure;
+use Illuminate\Http\Request;
+class CheckLicense {
+    public function handle(Request $request, Closure $next) {
+        $key = env('LICENSE_KEY');
+        if (!$key) {
+            abort(403, 'License key missing.');
+        }
+        // For demo: accept our pre-generated key, or you can implement HMAC validation
+        if ($key !== trim('SMMSLICE-2025-HYBRID-KEY-987654321')) {
+            abort(403, 'Invalid license.');
+        }
+        return $next($request);
+    }
+}
+PHP
+
+# Register middleware in Kernel (append to $middlewareGroups 'web')
+php -r '
+$k = file_get_contents("app/Http/Kernel.php");
+if (strpos($k, "App\\\\Http\\\\Middleware\\\\CheckLicense::class") === false) {
+    $k = str_replace("\'web\' => [", "\'web\' => [\n            \\App\\Http\\Middleware\\CheckLicense::class,", $k);
+    file_put_contents("app/Http/Kernel.php", $k);
+    echo "Middleware registered in Kernel.\n";
+} else {
+    echo "Middleware already present.\n";
+}
+'
+
+echo "=== Adding Models, Migrations and Seeders ==="
+
+# User model exists; create Service, Order, Provider, Payment models & migrations (simple)
+php <<'PHPCODE'
+<?php
+// create migration files quickly using raw file writes for portability
+$ts = time();
+$migrations = [
+    ['create_services_table', "<?php\nuse Illuminate\\Database\\Migrations\\Migration;\nuse Illuminate\\Database\\Schema\\Blueprint;\nuse Illuminate\\Support\\Facades\\Schema;\n\nreturn new class extends Migration {\n    public function up(){ Schema::create('services', function(Blueprint \$table){\$table->id();\$table->string('title');\$table->text('desc')->nullable();\$table->decimal('price',14,2); \$table->integer('min')->default(1); \$table->integer('max')->default(10000); \$table->timestamps();});}\n    public function down(){ Schema::dropIfExists('services'); }\n};"],
+    ['create_providers_table', "<?php\nuse Illuminate\\Database\\Migrations\\Migration;\nuse Illuminate\\Database\\Schema\\Blueprint;\nuse Illuminate\\Support\\Facades\\Schema;\n\nreturn new class extends Migration {\n    public function up(){ Schema::create('providers', function(Blueprint \$table){\$table->id();\$table->string('name');\$table->string('api_endpoint')->nullable();\$table->string('api_key')->nullable();\$table->boolean('active')->default(true); \$table->timestamps();});}\n    public function down(){ Schema::dropIfExists('providers'); }\n};"],
+    ['create_orders_table', "<?php\nuse Illuminate\\Database\\Migrations\\Migration;\nuse Illuminate\\Database\\Schema\\Blueprint;\nuse Illuminate\\Support\\Facades\\Schema;\n\nreturn new class extends Migration {\n    public function up(){ Schema::create('orders', function(Blueprint \$table){\$table->id();\$table->unsignedBigInteger('user_id');\$table->unsignedBigInteger('service_id');\$table->integer('quantity');\$table->decimal('price',14,2);\$table->string('status')->default('pending');\$table->string('provider_order_id')->nullable();\$table->timestamps();});}\n    public function down(){ Schema::dropIfExists('orders'); }\n};"],
+    ['create_payments_table', "<?php\nuse Illuminate\\Database\\Migrations\\Migration;\nuse Illuminate\\Database\\Schema\\Blueprint;\nuse Illuminate\\Support\\Facades\\Schema;\n\nreturn new class extends Migration {\n    public function up(){ Schema::create('payments', function(Blueprint \$table){\$table->id();\$table->unsignedBigInteger('user_id');\$table->unsignedBigInteger('order_id')->nullable();\$table->decimal('amount',14,2);\$table->string('gateway');\$table->string('status')->default('pending');\$table->string('transaction_id')->nullable();\$table->timestamps();});}\n    public function down(){ Schema::dropIfExists('payments'); }\n};"]
+];
+
+foreach($migrations as $i => $m){
+    $name = date('Y_m_d_His', time()+$i) . "_{$m[0]}.php";
+    file_put_contents("database/migrations/{$name}", $m[1]);
+}
+echo "Migrations created.\n";
+PHPCODE
+
+# Simple Eloquent Models
+cat > app/Models/Service.php <<'PHP'
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+class Service extends Model {
+    use HasFactory;
+    protected $fillable = ['title','desc','price','min','max'];
+}
+PHP
+
+cat > app/Models/Provider.php <<'PHP'
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+class Provider extends Model {
+    use HasFactory;
+    protected $fillable = ['name','api_endpoint','api_key','active'];
+}
+PHP
+
+cat > app/Models/Order.php <<'PHP'
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+class Order extends Model {
+    use HasFactory;
+    protected $fillable = ['user_id','service_id','quantity','price','status','provider_order_id'];
+}
+PHP
+
+cat > app/Models/Payment.php <<'PHP'
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+class Payment extends Model {
+    use HasFactory;
+    protected $fillable = ['user_id','order_id','amount','gateway','status','transaction_id'];
+}
+PHP
+
+echo "=== Adding Controllers: Admin, API, Payment Adapters (stubs) ==="
+
+cat > app/Http/Controllers/Admin/DashboardController.php <<'PHP'
+<?php
+namespace App\Http\Controllers\Admin;
+use App\Http\Controllers\Controller;
+use App\Models\Service;
+use Illuminate\Http\Request;
+class DashboardController extends Controller {
+    public function index(){
+        $services = Service::all();
+        return view('admin.dashboard', compact('services'));
+    }
+    public function importMockProvider(Request $req){
+        // simple mock: add sample services
+        for($i=1;$i<=5;$i++){
+            Service::create(['title'=>"Mock Service #{$i}", 'desc'=>"Imported from mock provider", 'price'=>rand(10,500),'min'=>1,'max'=>10000]);
+        }
+        return redirect()->route('admin.dashboard')->with('success','Imported 5 mock services.');
+    }
+}
+PHP
+
+cat > app/Http/Controllers/Api/OrderController.php <<'PHP'
+<?php
+namespace App\Http\Controllers\Api;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Order;
+use App\Models\Service;
+class OrderController extends Controller {
+    public function create(Request $req){
+        $user = $req->user();
+        $service = Service::findOrFail($req->service_id);
+        $quantity = intval($req->quantity);
+        $price = $service->price * $quantity;
+        $order = Order::create(['user_id'=>$user->id,'service_id'=>$service->id,'quantity'=>$quantity,'price'=>$price,'status'=>'processing']);
+        // simulate provider processing (in real code call provider API)
+        $order->update(['status'=>'completed','provider_order_id'=>'MOCK-'.rand(1000,9999)]);
+        return response()->json(['success'=>true,'order'=>$order]);
+    }
+}
+PHP
+
+# Payment adapter stubs
+mkdir -p app/Services/PaymentAdapters
+cat > app/Services/PaymentAdapters/StripeAdapter.php <<'PHP'
+<?php
+namespace App\Services\PaymentAdapters;
+class StripeAdapter {
+    public static function createIntent($amount, $currency='INR') {
+        // sandbox stub: return simulated client_secret
+        return ['client_secret' => 'pi_client_secret_mock_'.uniqid()];
+    }
+}
+PHP
+
+cat > app/Services/PaymentAdapters/PaypalAdapter.php <<'PHP'
+<?php
+namespace App\Services\PaymentAdapters;
+class PaypalAdapter {
+    public static function createOrder($amount, $currency='INR') {
+        return ['approve_url'=>'https://www.sandbox.paypal.com/checkoutnow?token=MOCK'];
+    }
+}
+PHP
+
+cat > app/Services/PaymentAdapters/RazorpayAdapter.php <<'PHP'
+<?php
+namespace App\Services\PaymentAdapters;
+class RazorpayAdapter {
+    public static function createOrder($amount, $currency='INR') {
+        return ['id'=>'order_mock_'.uniqid()];
+    }
+}
+PHP
+
+cat > app/Services/PaymentAdapters/CoinpaymentsAdapter.php <<'PHP'
+<?php
+namespace App\Services\PaymentAdapters;
+class CoinpaymentsAdapter {
+    public static function createCharge($amount, $currency='INR') {
+        return ['checkout_url'=>'https://www.coinpayments.net/index.php?cmd=_pay&amount='.$amount];
+    }
+}
+PHP
+
+echo "=== Adding Routes (web + api) ==="
+cat > routes/web.php <<'PHP'
+<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Admin\DashboardController;
+
+Route::get('/', function(){ return view('welcome'); });
+
+// admin routes (middleware checks license)
+Route::middleware(['web','checklicense'])->group(function(){
+    Route::get('/admin', [DashboardController::class,'index'])->name('admin.dashboard');
+    Route::post('/admin/import-mock', [DashboardController::class,'importMockProvider'])->name('admin.import.mock');
+});
+PHP
+
+cat > routes/api.php <<'PHP'
+<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Api\OrderController;
+
+Route::middleware('auth:sanctum')->group(function(){
+    Route::post('/orders', [OrderController::class,'create']);
+});
+PHP
+
+echo "=== Creating simple blade views ==="
+cat > resources/views/layouts/app.blade.php <<'HTML'
+<!doctype html>
+<html>
+<head><title>SMM Slice Demo</title></head>
+<body>
+<div class="container">
+    <nav><a href="/">Home</a> | <a href="/admin">Admin</a></nav>
+    <main>@yield('content')</main>
+</div>
+</body>
+</html>
+HTML
+
+cat > resources/views/admin/dashboard.blade.php <<'HTML'
+@extends('layouts.app')
+@section('content')
+<h2>Admin Dashboard</h2>
+<p>License: {{ env('LICENSE_KEY') }}</p>
+@if(session('success')) <div style="color:green">{{ session('success') }}</div> @endif
+<form method="POST" action="{{ route('admin.import.mock') }}">
+    @csrf
+    <button type="submit">Import Mock Provider Services</button>
+</form>
+<h3>Services</h3>
+<ul>
+@foreach($services as $s)
+    <li>{{ $s->title }} — Rs.{{ $s->price }}</li>
+@endforeach
+</ul>
+@endsection
+HTML
+
+cat > resources/views/welcome.blade.php <<'HTML'
+@extends('layouts.app')
+@section('content')
+<h1>Welcome to SMM Slice Demo</h1>
+<p><a href="/admin">Go to admin</a></p>
+@endsection
+HTML
+
+echo "=== Seeder: admin user, customer and sample services ==="
+cat > database/seeders/DatabaseSeeder.php <<'PHP'
+<?php
+namespace Database\Seeders;
+use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+
+class DatabaseSeeder extends Seeder {
+    public function run(){
+        // admin
+        DB::table('users')->insert([
+            'name'=>'Admin','email'=>env('ADMIN_EMAIL','admin@example.com'),
+            'email_verified_at'=>now(),'password'=>Hash::make(env('ADMIN_PASSWORD','password')),'remember_token'=>Str::random(10),'created_at'=>now(),'updated_at'=>now()
+        ]);
+        // test customer
+        DB::table('users')->insert([
+            'name'=>'Buyer','email'=>'buyer@example.com',
+            'email_verified_at'=>now(),'password'=>Hash::make('BuyerPass123'),'remember_token'=>Str::random(10),'created_at'=>now(),'updated_at'=>now()
+        ]);
+        // sample services
+        for($i=1;$i<=5;$i++){
+            DB::table('services')->insert(['title'=>"Sample Service $i",'desc'=>'Demo','price'=>rand(20,500),'min'=>1,'max'=>10000,'created_at'=>now(),'updated_at'=>now()]);
+        }
+    }
+}
+PHP
+
+echo "=== Composer install & key generate ==="
+composer install --no-interaction
+php artisan key:generate
+
+echo "=== Running migrations & seeder ==="
+php artisan migrate --force
+php artisan db:seed --class=DatabaseSeeder --force
+
+echo "=== Final touches: npm (optional) and zip ==="
+if command -v npm >/dev/null 2>&1; then
+  npm install --no-audit --no-fund || true
+  npm run build || true
+fi
+
+cd ..
+zip -r ${PROJECT_NAME}.zip ${PROJECT_NAME}
+
+echo "=== DONE: ${PROJECT_NAME}.zip created in current folder ==="
+echo "Open ${PROJECT_NAME} folder, update .env values (real gateway keys), configure web server (public folder) and HTTPS for webhooks."
+echo "Admin credentials: $ADMIN_EMAIL / $ADMIN_PASS"
+echo "Test customer: $CUSTOMER_EMAIL / $CUSTOMER_PASS"
